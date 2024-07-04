@@ -1,3 +1,5 @@
+parameters:
+  AzureSubscriptionId: ""
 steps:
   - script: |
       echo "Hello world"
