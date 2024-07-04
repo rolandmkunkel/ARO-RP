@@ -1,151 +1,111 @@
-trigger: none
-pr: none
+parameters:
+  ACRName: ""
+  AroVersionStorageAccount: ""
+  AzureCloudName: ""
+  AzureClusterAppID: ""
+  AzureClusterAppSecret: ""
+  AzureClusterServicePrinicpalID: ""
+  AzureDevopsJSONSPN: ""
+  AzureEnvironment: ""
+  AzureFPClientID: ""
+  AzureFPServicePrincipalID: ""
+  AzureSubscriptionId: ""
+  BuildID: "" # not from rp-config. The EV2 manifest pipeline gets this from the BUILD_BUILDID env variable
+  E2EACILocation: ""  # expected to be eastus in public cloud and prod environment, otherwise just the region (see EV2 manifest)
+  E2EACIResourceGroup: ""
+  E2ESubscriptionID: ""
+  EnvironmentName: ""
+  Image: ""
+  MDME2EAccount: ""
+  MDME2ENamespace: ""
+  OSClusterVersion: ""  # not from rp-config. The EV2 manifest pipeline gets this from the OS_CLUSTER_VERSION env variable
+  RPLocation: ""
+  StorageSuffix: ""
 
-resources:
-  pipelines:
-    - pipeline: e2e
-      source: CI
-      trigger: true
-  containers:
-    - container: container
-      image: registry.access.redhat.com/ubi8/toolbox:8.8
-      options: --user=0 --privileged -v /dev/shm:/dev/shm --device /dev/net/tun --name vpn
 
-# Azure DevOps Pipeline running e2e tests
-variables:
-  - template: vars.yml
+steps:
+  - script: |
+      echo "Running E2E"
+  - template: ./templates/template-checkout.yml
 
-# Run the test suite and collect must-gather
-jobs:
-  - job: E2E
-    timeoutInMinutes: 180
-    variables:
-      ARO_PODMAN_SOCKET: "tcp://localhost:8888"
-      ARO_SELENIUM_HOSTNAME: "localhost"
-    pool:
-      name: 1es-aro-ci-pool
-    steps:
-      - template: ./templates/template-checkout.yml
+  - script: |
+      set -xe
+      sudo rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+      sudo dnf install -y openvpn make podman jq
+    displayName: Setup (Container)
+    target: container
 
-      - script: |
-          set -xe
-          sudo rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
-          sudo dnf install -y openvpn make podman jq
-        displayName: Setup (Container)
-        target: container
+  - template: ./templates/template-az-cli-login.yml
+    parameters:
+      azureDevOpsJSONSPN: ${{ parameters.AzureDevopsJSONSPN }}
+  - script: |
+      make extract-aro-docker
+    displayName: Extract ARO binaries from build
 
-      - template: ./templates/template-az-cli-login.yml
-        parameters:
-          azureDevOpsJSONSPN: $(aro-v4-e2e-devops-spn)
-      - template: ./templates/template-push-images-to-acr.yml
-        parameters:
-          rpImageACR: $(RP_IMAGE_ACR)
-          acrCredentialsJSON: $(acr-credentials)
-      - script: |
-          make extract-aro-docker
-        displayName: Extract ARO binaries from build
+  - script: |
+      az account set -s ${{ parameters.AzureSubscriptionId }}
+      SECRET_SA_ACCOUNT_NAME=$(SECRET_SA_ACCOUNT_NAME) make secrets
+      . secrets/env
+      
+      VERSION=$(curl -sf "https://${{ parameters.AzureSubscriptionId }}.blob.core.${{ parameters.StorageSuffix }}/rpversion/${{ parameters.RPLocation }}")
+      TOKEN=$(az acr login --name ${{ parameters.ACRName }} --expose-token --output tsv --query accessToken)
+    
+      E2E_RG_NAME="v4-e2e-V${{ parameters.BuildID }}-${{ parameters.RPLocation }}-${{ parameters.EnvironmentName }}"
+      E2E_CONTAINER_NAME="e2e-${{ parameters.RPLocation }}-${{ parameters.EnvironmentName }}"
+      
+      az container create \
+          -g {{ parameters.E2EACIResourceGroup }} \
+          --location {{ parameters.E2EACILocation }} \
+          --name "$E2E_CONTAINER_NAME" \
+          --image "${{ parameters.Image }}:$VERSION" \
+          --command-line "e2e.test -test.v --ginkgo.v --ginkgo.timeout 180m --ginkgo.flake-attempts=2 --ginkgo.no-color" \
+          --registry-username "00000000-0000-0000-0000-000000000000" \
+          --registry-password "$TOKEN" \
+          --environment-variables \
+          CI=true \
+          AZURE_CLIENT_ID=$AZURE_CLIENT_ID \
+          AZURE_CLOUD_NAME=${{ parameters.AzureCloudName }} \
+          AZURE_ENVIRONMENT=${{ parameters.AzureEnvironment }} \
+          AZURE_FP_CLIENT_ID=${{ parameters.AzureFPClientID }} \
+          AZURE_FP_SERVICE_PRINCIPAL_ID=${{ parameters.AzureFPServicePrincipalID }} \
+          AZURE_TENANT_ID=$E2E_TENANT_ID \
+          #AZURE_SUBSCRIPTION_ID=${{ parameters.E2ESubscriptionID }} \
+          LOCATION=$RP_LOCATION \
+          MDM_E2E_ACCOUNT=${{ parameters.MDME2EAccount }} \
+          MDM_E2E_NAMESPACE=${{ parameters.MDME2ENamespace }} \
+          RESOURCEGROUP="$E2E_RG_NAME" \
+          CLUSTER="$E2E_RG_NAME" \
+          OS_CLUSTER_VERSION="${{ parameters.OSClusterVersion }}" \
+          --secure-environment-variables \
+          AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET \
+          AZURE_CLUSTER_APP_ID=$AZURE_CLUSTER_APP_ID \
+          AZURE_CLUSTER_SERVICE_PRINCIPAL_ID=$AZURE_CLUSTER_SERVICE_PRINCIPAL_ID \
+          AZURE_CLUSTER_APP_SECRET=$AZURE_CLUSTER_APP_SECRET \
+          --restart-policy Never
+      
+      E2E_CONTAINER_RUN_STATUS=$(az container show -g {{ parameters.E2EACIResourceGroup }} --name $E2E_CONTAINER_NAME --query containers[].instanceView.currentState.state -o tsv)
+      while [[ $E2E_CONTAINER_RUN_STATUS != "Terminated" ]]
+      do
+          echo "Waiting for e2e test container to terminate. Sleeping for 1 minute."
+          sleep 60
+          E2E_CONTAINER_RUN_STATUS=$(az container show -g {{ parameters.E2EACIResourceGroup }} --name $E2E_CONTAINER_NAME --query containers[].instanceView.currentState.state -o tsv)
+      done
 
-      - script: |
-          az account set -s $AZURE_SUBSCRIPTION_ID
-          SECRET_SA_ACCOUNT_NAME=$(SECRET_SA_ACCOUNT_NAME) make secrets
-          . secrets/env
+      echo "E2E container terminated. Checking test status."
 
-          export CI=true
-          . ./hack/e2e/run-rp-and-e2e.sh
-          get_cluster_sp
-          deploy_e2e_db
-        displayName: Setup (Azure)
+      E2E_TEST_RESULT=$(az container show -g {{ parameters.E2EACIResourceGroup }} --name $E2E_CONTAINER_NAME --query instanceView.state -o tsv)
 
-      - script: |
-          export CI=true
-          . secrets/env
-          . ./hack/e2e/run-rp-and-e2e.sh
+      echo "Test Result: ${E2E_TEST_RESULT} - Displaying logs..."
+      echo "=============================="
+      # print logs, but slow them down to avoid ev2 throttling
+      # https://ev2docs.azure.net/features/extensibility/shell/intro.html#my-shell-execution-logs-are-getting-truncated-when-i-view-my-rollout-how-do-i-view-my-logs
+      az container logs -g {{ parameters.E2EACIResourceGroup }} -n $E2E_CONTAINER_NAME
+      echo "=============================="
 
-          run_vpn
+      if [[ $E2E_TEST_RESULT == "Failed" ]]
+      then
+          echo "TEST FAILURE!! Please see az container logs above."
 
-          run_podman
-          validate_podman_running
-
-          run_portal
-          validate_portal_running
-
-          run_selenium
-          validate_selenium_running
-
-          run_rp
-          validate_rp_running
-
-          register_sub
-
-          make test-e2e -o e2e.test
-        displayName: Execute Tests
-        target: container
-
-      - script: |
-          export CI=true
-          . ./hack/e2e/run-rp-and-e2e.sh
-          set -x
-
-          # retrieve the kubeconfig
-          hack/get-admin-kubeconfig.sh /subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$CLUSTER/providers/Microsoft.RedHatOpenShift/openShiftClusters/$CLUSTER >admin.kubeconfig
-        displayName: Get admin kubeconfig for must-gather
-        condition: failed()
-      # must-gather collection must be run inside the container so it can access the VPN
-      - script: |
-          export CI=true
-          . ./hack/e2e/run-rp-and-e2e.sh
-
-          export KUBECONFIG=admin.kubeconfig
-
-          # retrieve the oc cli
-          wget -nv https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/$(OpenShiftCLIVersion)/openshift-client-linux-$(OpenShiftCLIVersion).tar.gz
-          tar xf openshift-client-linux-$(OpenShiftCLIVersion).tar.gz
-          ./oc adm must-gather --image quay.io/cmarches/aro-must-gather:20231030.00
-          tar cf must-gather.tar.gz must-gather.local.*
-        displayName: Collect must-gather
-        target: container
-        condition: failed()
-      - publish: must-gather.tar.gz
-        artifact: must-gather
-        displayName: Append must-gather to Pipeline
-        condition: failed()
-
-      - script: |
-          export CI=true
-          . ./hack/e2e/run-rp-and-e2e.sh
-
-          delete_e2e_cluster
-          kill_rp
-          kill_selenium
-          kill_podman
-          kill_vpn
-        displayName: Cleanup
-        condition: always()
-        target: container
-      - script: |
-          export CI=true
-          . ./hack/e2e/run-rp-and-e2e.sh
-          clean_e2e_db
-        displayName: Cleanup (Azure)
-        condition: always()
-      - template: ./templates/template-az-cli-logout.yml
-
-      - task: PublishTestResults@2
-        displayName: 📊 Publish tests results
-        inputs:
-          testResultsFiles: $(System.DefaultWorkingDirectory)/**/e2e-report.xml
-        condition: succeededOrFailed()
-
-      - task: CopyFiles@2
-        condition: succeededOrFailed()
-        inputs:
-          contents: |
-            $(Build.SourcesDirectory)/*.png
-            $(Build.SourcesDirectory)/*.html
-          targetFolder: $(Build.ArtifactStagingDirectory)
-
-      - task: PublishBuildArtifacts@1
-        condition: succeededOrFailed()
-        inputs:
-          pathToPublish: $(Build.ArtifactStagingDirectory)
-          artifactName: Screenshots
+          exit 1
+      fi
+      exit 0
