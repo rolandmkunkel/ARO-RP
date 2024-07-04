@@ -3,3 +3,4 @@ parameters:
 steps:
   - script: |
       echo "Hello world"
+      echo "${{ parameters.AzureSubscriptionId }}"
